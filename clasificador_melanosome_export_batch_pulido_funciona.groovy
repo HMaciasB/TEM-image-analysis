@@ -9,7 +9,7 @@ if (project == null) {
     return
 }
 
-def classifierName = "TRAINING_56.7KX"
+def classifierName = "V17_TYPES"
 def outputDir = buildFilePath(PROJECT_BASE_DIR, "exports")
 mkdirs(outputDir)
 

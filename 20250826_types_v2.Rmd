@@ -1,0 +1,1208 @@
+---
+title: "20250826_types"
+author: "Henry Macías"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r}
+# Instalar paquetes necesarios (si no están instalados)
+# install.packages(c("dplyr", "tidyr", "car", "rstatix", "openxlsx", "ggplot2", "ggsignif"))
+
+# Cargar librerías
+library(dplyr)
+library(tidyr)
+library(car)        # para Levene
+library(rstatix)    # para pruebas Shapiro, Dunn
+library(openxlsx)   # para exportar a Excel
+library(ggplot2)
+library(ggsignif)
+
+# Opcional: asegurar que strings no se conviertan en factores automáticamente
+options(stringsAsFactors = FALSE)
+
+# 1. Leer el archivo CSV (ajustar la ruta si es necesario)
+df <- types_combined_FILTERED
+
+# Eliminar espacios en blancos de los nombres de columnas y quitar la columna 'Length'
+
+names(df) <- trimws(names(df))
+df <- df %>% select(-matches("^Length"))  # elimina columna cuyo nombre inicia con "Length"
+
+# Convertir columna 'Cellular_Type' a valores legibles (NORMAL vs MUTANT)
+df$Cellular_Type <- ifelse(grepl("NORMAL", df$Cellular_Type), "Normal", "Mutant")
+# Definir factores para mantener orden (Phenotype: PEL primero, WT después; Cellular_Type: Normal primero)
+df$Phenotype <- factor(df$Phenotype, levels = c("PEL", "WT"))
+df$Cellular_Type <- factor(df$Cellular_Type, levels = c("Normal", "Mutant"))
+
+# Añadir columna de "muestra base" (parte del nombre antes del primer guión bajo)
+df <- df %>% mutate(SampleBase = sub("_.*", "", Name))
+
+#PASO2
+# 2. Resumen por imagen (Name) para cada combinación de Phenotype y Cellular_Type
+image_summary <- df %>%
+  group_by(Name, Phenotype, Cellular_Type) %>%
+  summarise(
+    cell_count = n(),                       # número de células en esa imagen y tipo
+    mean_area = mean(Area),                # promedio del área
+    mean_circ = mean(Circularity),         # promedio de la circularidad
+    mean_maxd = mean(Max_diameter),        # promedio del diámetro máximo
+    mean_mind = mean(Min_diameter),        # promedio del diámetro mínimo
+    .groups = "drop"
+  )
+
+#PASO3
+
+# 3. Resumen por muestra base (SampleBase) – promedios de promedios e conteos por muestra
+sample_summary <- image_summary %>%
+  group_by(SampleBase, Phenotype, Cellular_Type) %>%
+  summarise(
+    mean_count_per_image = mean(cell_count),  # promedio de células por imagen en la muestra (no usado para exportar)
+    mean_area = mean(mean_area),              # promedio de áreas promedio (por imagen) en la muestra
+    mean_circ = mean(mean_circ),              # promedio de circularidades promedio en la muestra
+    mean_maxd = mean(mean_maxd),              # promedio de diámetros máximos promedio en la muestra
+    mean_mind = mean(mean_mind),              # promedio de diámetros mínimos promedio en la muestra
+    total_cells = sum(cell_count),            # total de células de ese tipo en la muestra (suma de imágenes)
+    .groups = "drop"
+  )
+
+# Preparar tabla de promedios por muestra base en formato ancho (una fila por muestra)
+resumen_muestras <- sample_summary %>%
+  select(SampleBase, Phenotype, Cellular_Type, mean_area, mean_circ, mean_maxd, mean_mind, total_cells) %>%
+  pivot_wider(names_from = Cellular_Type,
+              values_from = c(mean_area, mean_circ, mean_maxd, mean_mind, total_cells))
+
+# Renombrar columnas para mayor claridad
+resumen_muestras <- resumen_muestras %>% rename(
+  Mean_Area_Normal = mean_area_Normal,
+  Mean_Area_Mutant = mean_area_Mutant,
+  Mean_Circularity_Normal = mean_circ_Normal,
+  Mean_Circularity_Mutant = mean_circ_Mutant,
+  Mean_Max_diameter_Normal = mean_maxd_Normal,
+  Mean_Max_diameter_Mutant = mean_maxd_Mutant,
+  Mean_Min_diameter_Normal = mean_mind_Normal,
+  Mean_Min_diameter_Mutant = mean_mind_Mutant,
+  Count_Normal = total_cells_Normal,
+  Count_Mutant = total_cells_Mutant
+) %>% arrange(Phenotype, SampleBase)
+
+#PASO 4
+
+# 4. Pruebas de supuestos para cada variable (normalidad por grupo y homogeneidad de varianza)
+# Crear estructura para guardar resultados
+normalidad_resultados <- data.frame(
+  Var = character(), 
+  Shapiro_PEL_Normal = numeric(),
+  Shapiro_PEL_Mutant = numeric(),
+  Shapiro_WT_Normal = numeric(),
+  Shapiro_WT_Mutant = numeric(),
+  Levene_p = numeric()
+)
+
+# Para cada variable de interés, calcular p-valores de Shapiro por grupo y Levene global
+variables <- c("mean_area", "mean_circ", "mean_maxd", "mean_mind", "total_cells")
+var_names <- c(mean_area = "Area", mean_circ = "Circularity", 
+               mean_maxd = "Max_diameter", mean_mind = "Min_diameter",
+               total_cells = "Count")
+for (var in variables) {
+  # Nombre legible de la variable
+  var_name <- var_names[[var]]
+  
+  # Valores de la variable por grupo (Group ya combina Phenotype_Type)
+  sample_summary$Group <- factor(sample_summary$Group, 
+                                 levels = c("PEL_Normal", "PEL_Mutant", "WT_Normal", "WT_Mutant"))
+  values <- sample_summary[[var]]
+  
+  # Shapiro-Wilk por cada grupo
+  p_shap <- tapply(values, sample_summary$Group, function(x) shapiro.test(x)$p.value)
+  # Prueba de Levene para igualdad de varianzas entre grupos
+  p_levene <- car::leveneTest(values ~ sample_summary$Group)[["Pr(>F)"]][1]
+  
+  # Agregar fila de resultados
+  normalidad_resultados <- rbind(normalidad_resultados, data.frame(
+    Var = var_name,
+    Shapiro_PEL_Normal = p_shap["PEL_Normal"],
+    Shapiro_PEL_Mutant = p_shap["PEL_Mutant"],
+    Shapiro_WT_Normal = p_shap["WT_Normal"],
+    Shapiro_WT_Mutant = p_shap["WT_Mutant"],
+    Levene_p = p_levene
+  ))
+}
+
+# Redondear p-valores a 3 cifras significativas para legibilidad
+normalidad_resultados[ , 2:6] <- lapply(normalidad_resultados[ , 2:6], function(x) signif(x, 3))
+normalidad_resultados
+
+#PASO5 
+
+# 5. Comparaciones estadísticas para las combinaciones solicitadas
+# Función para asignar código de significancia según p-value
+signif_code <- function(p) {
+  if (p < 0.001) "***"
+  else if (p < 0.01) "**"
+  else if (p < 0.05) "*"
+  else "n.s."
+}
+
+# Precalcular número total de células por grupo (para reporte de n)
+cell_counts <- df %>% group_by(Phenotype, Cellular_Type) %>% summarise(ncells = n(), .groups = "drop")
+cell_counts <- cell_counts %>% mutate(Group = paste(Phenotype, Cellular_Type, sep = "_"))
+cell_count_map <- setNames(cell_counts$ncells, cell_counts$Group)  # vector nombrado con totales de células
+
+# Lista de comparaciones de interés (pares de grupos a comparar)
+comparisons <- list(
+  c("PEL_Normal", "PEL_Mutant"),
+  c("WT_Normal", "WT_Mutant"),
+  c("PEL_Normal", "WT_Normal"),
+  c("PEL_Mutant", "WT_Mutant")
+)
+
+# Preparar data frame para resultados
+resultados_comparaciones <- data.frame(
+  Var = character(), Comparison = character(), Test = character(),
+  p_value = numeric(), Significance = character(),
+  n1 = numeric(), n2 = numeric()
+)
+
+# Iterar sobre cada variable y realizar comparación adecuada
+for (var in variables) {
+  var_name <- var_names[[var]]
+  
+  # Decidir si usar ANOVA o Kruskal-Wallis según resultados de normalidad/homogeneidad
+  fila_supuestos <- normalidad_resultados[normalidad_resultados$Var == var_name, ]
+  parametric <- TRUE
+  # Si alguna Shapiro da p<0.05 o Levene p<0.05, usar no paramétrico
+  if (any(as.numeric(fila_supuestos[1, 2:5]) < 0.05) || as.numeric(fila_supuestos$Levene_p) < 0.05) {
+    parametric <- FALSE
+  }
+  
+  if (parametric) {
+    # ANOVA de un factor (grupo combinado) y test post-hoc de Tukey
+    model <- aov(as.formula(paste(var, "~ Group")), data = sample_summary)
+    tukey_res <- TukeyHSD(model, "Group")$Group %>% as.data.frame()
+    tukey_res$Comparison <- rownames(TukeyHSD(model, "Group")$Group)
+    # Filtrar comparaciones de interés
+    tukey_res <- tukey_res %>% separate(Comparison, into = c("group1", "group2"), sep = "-") %>%
+      filter((group1 == "PEL_Normal" & group2 == "PEL_Mutant") |
+             (group1 == "WT_Normal" & group2 == "WT_Mutant") |
+             (group1 == "PEL_Normal" & group2 == "WT_Normal") |
+             (group1 == "PEL_Mutant" & group2 == "WT_Mutant"))
+    # Agregar resultados de cada comparación
+    for (i in 1:nrow(tukey_res)) {
+      g1 <- tukey_res$group1[i]; g2 <- tukey_res$group2[i]
+      comp_label <- if (g1 %in% c("PEL_Normal","PEL_Mutant") && g2 %in% c("PEL_Normal","PEL_Mutant")) {
+                      "PEL: NORMAL vs MUTANT"
+                    } else if (g1 %in% c("WT_Normal","WT_Mutant") && g2 %in% c("WT_Normal","WT_Mutant")) {
+                      "WT: NORMAL vs MUTANT"
+                    } else if (grepl("Normal", g1) && grepl("Normal", g2)) {
+                      "NORMAL: PEL vs WT"
+                    } else {
+                      "MUTANT: PEL vs WT"
+                    }
+      p_val <- tukey_res$`p.adj`[i]
+      resultados_comparaciones <- rbind(resultados_comparaciones, data.frame(
+        Var = var_name,
+        Comparison = comp_label,
+        Test = "ANOVA (Tukey)",
+        p_value = p_val,
+        Significance = signif_code(p_val),
+        n1 = cell_count_map[g1],
+        n2 = cell_count_map[g2]
+      ))
+    }
+  } else {
+    # Kruskal-Wallis y test post-hoc de Dunn
+    # (Primero ejecutar KW global para referencia, aunque reportamos comparaciones)
+    kw <- kruskal.test(as.formula(paste(var, "~ Group")), data = sample_summary)
+    dunn_res <- sample_summary %>% dunn_test(as.formula(paste(var, "~ Group")), p.adjust.method = "bonferroni")
+    # Filtrar comparaciones de interés
+    dunn_res <- dunn_res %>% filter(
+      (group1 == "PEL_Normal" & group2 == "PEL_Mutant") |
+      (group1 == "WT_Normal" & group2 == "WT_Mutant") |
+      (group1 == "PEL_Normal" & group2 == "WT_Normal") |
+      (group1 == "PEL_Mutant" & group2 == "WT_Mutant")
+    )
+    for (i in 1:nrow(dunn_res)) {
+      g1 <- dunn_res$group1[i]; g2 <- dunn_res$group2[i]
+      comp_label <- if (g1 %in% c("PEL_Normal","PEL_Mutant") && g2 %in% c("PEL_Normal","PEL_Mutant")) {
+                      "PEL: NORMAL vs MUTANT"
+                    } else if (g1 %in% c("WT_Normal","WT_Mutant") && g2 %in% c("WT_Normal","WT_Mutant")) {
+                      "WT: NORMAL vs MUTANT"
+                    } else if (grepl("Normal", g1) && grepl("Normal", g2)) {
+                      "NORMAL: PEL vs WT"
+                    } else {
+                      "MUTANT: PEL vs WT"
+                    }
+      p_val <- dunn_res$p.adj[i]
+      resultados_comparaciones <- rbind(resultados_comparaciones, data.frame(
+        Var = var_name,
+        Comparison = comp_label,
+        Test = "Kruskal-Wallis (Dunn)",
+        p_value = p_val,
+        Significance = signif_code(p_val),
+        n1 = cell_count_map[g1],
+        n2 = cell_count_map[g2]
+      ))
+    }
+  }
+}
+
+# Redondear p_value para legibilidad
+resultados_comparaciones$p_value <- signif(resultados_comparaciones$p_value, 3)
+resultados_comparaciones
+
+#PASO 6
+
+# 6. Exportar los resultados a un archivo Excel con las hojas requeridas
+write.xlsx(list(
+    "Resumen_por_muestra" = resumen_muestras,
+    "Normalidad_Homogeneidad" = normalidad_resultados,
+    "Comparaciones_estadisticas" = resultados_comparaciones
+  ), file = "RESULTADOS_ANALISIS_COMPLETO.xlsx", overwrite = TRUE)
+
+#PASO 7:
+
+# 7. Graficar comparaciones para cada variable morfológica
+# Crear carpeta de salida de gráficos (opcional)
+# dir.create("graficos")
+
+# Variables morfológicas a graficar
+variables_morf <- c("Area", "Circularity", "Max_diameter", "Min_diameter")
+for (var_name in variables_morf) {
+  # Obtener datos resumidos por grupo (Phenotype + Type) para la variable
+  # (media y desviación estándar de valores por muestra)
+  col_name <- names(var_names)[var_names == var_name]  # nombre interno correspondiente (mean_area, etc.)
+  group_stats <- sample_summary %>%
+    group_by(Phenotype, Cellular_Type) %>%
+    summarise(mean = mean(.data[[col_name]]), sd = sd(.data[[col_name]]), .groups = "drop")
+  
+  # Significancias de las comparaciones para esta variable
+  sig_PEL <- resultados_comparaciones %>% filter(Var == var_name, Comparison == "PEL: NORMAL vs MUTANT") %>% pull(Significance)
+  sig_WT <- resultados_comparaciones %>% filter(Var == var_name, Comparison == "WT: NORMAL vs MUTANT") %>% pull(Significance)
+  sig_Normal <- resultados_comparaciones %>% filter(Var == var_name, Comparison == "NORMAL: PEL vs WT") %>% pull(Significance)
+  sig_Mutant <- resultados_comparaciones %>% filter(Var == var_name, Comparison == "MUTANT: PEL vs WT") %>% pull(Significance)
+  
+  # Calcular posiciones en y para las barras (para ubicar las etiquetas de significancia)
+  # Dentro de PEL y WT (Normal vs Mutant)
+  pel_stats <- group_stats %>% filter(Phenotype == "PEL")
+  wt_stats  <- group_stats %>% filter(Phenotype == "WT")
+  y_PEL <- max(pel_stats$mean + pel_stats$sd) * 1.15
+  y_WT  <- max(wt_stats$mean + wt_stats$sd) * 1.15
+  # Dentro de Normal y Mutant (PEL vs WT)
+  norm_stats <- group_stats %>% filter(Cellular_Type == "Normal")
+  mut_stats  <- group_stats %>% filter(Cellular_Type == "Mutant")
+  y_Normal <- max(norm_stats$mean + norm_stats$sd) * 1.15
+  y_Mutant <- max(mut_stats$mean + mut_stats$sd) * 1.15
+  
+  # Grafico 1: NORMAL vs MUTANT en PEL y WT
+  plot1 <- ggplot(group_stats, aes(x = Phenotype, y = mean, fill = Cellular_Type)) +
+    geom_col(position = position_dodge(width = 0.8), width = 0.8) +
+    geom_errorbar(aes(ymin = mean - sd, ymax = mean + sd), width = 0.2,
+                  position = position_dodge(width = 0.8)) +
+    # Agregar brackets de significancia para PEL y WT
+    geom_signif(data = data.frame(xmin = c(0.8, 1.8), xmax = c(1.2, 2.2),
+                                  annotations = c(sig_PEL, sig_WT),
+                                  y_position = c(y_PEL, y_WT)),
+                aes(xmin = xmin, xmax = xmax, annotations = annotations, y_position = y_position),
+                manual = TRUE, tip_length = 0.02) +
+    labs(x = "Phenotype", y = paste(var_name, "(mean ± SD)"), fill = "Cell Type",
+         title = paste(var_name, "- Normal vs Mutant (PEL vs WT)")) +
+    theme_minimal()
+  
+  ggsave(filename = paste0(var_name, "_Normal_vs_Mutant_PEL_WT.svg"), plot = plot1, width = 6, height = 4)
+  ggsave(filename = paste0(var_name, "_Normal_vs_Mutant_PEL_WT.jpg"), plot = plot1, width = 6, height = 4)
+  
+  # Grafico 2: PEL vs WT en NORMAL y MUTANT
+  plot2 <- ggplot(group_stats, aes(x = Cellular_Type, y = mean, fill = Phenotype)) +
+    geom_col(position = position_dodge(width = 0.8), width = 0.8) +
+    geom_errorbar(aes(ymin = mean - sd, ymax = mean + sd), width = 0.2,
+                  position = position_dodge(width = 0.8)) +
+    geom_signif(data = data.frame(xmin = c(0.8, 1.8), xmax = c(1.2, 2.2),
+                                  annotations = c(sig_Normal, sig_Mutant),
+                                  y_position = c(y_Normal, y_Mutant)),
+                aes(xmin = xmin, xmax = xmax, annotations = annotations, y_position = y_position),
+                manual = TRUE, tip_length = 0.02) +
+    labs(x = "Cellular Type", y = paste(var_name, "(mean ± SD)"), fill = "Phenotype",
+         title = paste(var_name, "- PEL vs WT (Normal vs Mutant)")) +
+    theme_minimal()
+  
+  ggsave(filename = paste0(var_name, "_PEL_vs_WT_Normal_Mutant.svg"), plot = plot2, width = 6, height = 4)
+  ggsave(filename = paste0(var_name, "_PEL_vs_WT_Normal_Mutant.jpg"), plot = plot2, width = 6, height = 4)
+}
+  
+# Grafico 3: Número de células por tipo y fenotipo
+# Preparar datos de conteo total por grupo
+count_df <- cell_counts %>% rename(Type = Cellular_Type, Count = ncells)
+sig_PEL_count <- resultados_comparaciones %>% filter(Var == "Count", Comparison == "PEL: NORMAL vs MUTANT") %>% pull(Significance)
+sig_WT_count  <- resultados_comparaciones %>% filter(Var == "Count", Comparison == "WT: NORMAL vs MUTANT") %>% pull(Significance)
+y_PEL_count <- max(count_df$Count[count_df$Phenotype=="PEL"]) * 1.1
+y_WT_count  <- max(count_df$Count[count_df$Phenotype=="WT"]) * 1.1
+
+plot_count <- ggplot(count_df, aes(x = Phenotype, y = Count, fill = Type)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.8) +
+  geom_text(aes(label = Count), position = position_dodge(width = 0.8), vjust = -0.3, size = 3.5) +
+  geom_signif(data = data.frame(xmin = c(0.8, 1.8), xmax = c(1.2, 2.2),
+                                annotations = c(sig_PEL_count, sig_WT_count),
+                                y_position = c(y_PEL_count, y_WT_count)),
+              aes(xmin = xmin, xmax = xmax, annotations = annotations, y_position = y_position),
+              manual = TRUE, tip_length = 0.02) +
+  labs(x = "Phenotype", y = "Number of Cells", fill = "Cell Type",
+       title = "Cell Count by Phenotype and Cell Type") +
+  theme_minimal()
+
+ggsave(filename = "CellCount_by_Phenotype_Type.svg", plot = plot_count, width = 6, height = 4)
+ggsave(filename = "CellCount_by_Phenotype_Type.jpg", plot = plot_count, width = 6, height = 4)
+
+
+```
+
+```{r}
+# ============================================================
+# Análisis completo de fenotipo (PEL vs WT) y tipo celular (Normal vs Mutant)
+# - Lee CSV "types_combined_FILTERED.csv"
+# - Resume por imagen (Name) y luego por muestra base (SampleBase)
+# - Evalúa normalidad (Shapiro) y homogeneidad (Levene)
+# - Test global (ANOVA o Kruskal) y post-hoc (Tukey o Dunn)
+# - Extrae 4 comparaciones de interés y genera significancias (***, **, *, n.s.)
+# - Exporta todo a Excel
+# - Genera gráficos (SVG y JPG) con significancias
+# ============================================================
+
+# ---- Librerías ----
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(ggsignif)
+  library(openxlsx)
+  library(car)
+  library(rstatix)  # dunn_test
+})
+
+# ---- Config ----
+data_path <- types_combined_FILTERED  # Ajusta si es necesario
+out_dir   <- "outputs_analysis"
+if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+
+# ---- Utilidades ----
+p_to_stars <- function(p){
+  if (is.na(p)) return("n.s.")
+  if (p < 0.001) return("***")
+  if (p < 0.01)  return("**")
+  if (p < 0.05)  return("*")
+  "n.s."
+}
+
+# ---- Lectura y limpieza de datos ----
+df <- data_path
+
+# Normalizar nombres de columnas (quitar espacios finales, etc.)
+names(df) <- gsub("\\s+$", "", names(df))
+# Excluir cualquier columna Length (con o sin unidades)
+df <- df %>% select(-matches("^Length"))
+
+# Normalizar Cellular_Type a "Normal"/"Mutant"
+df <- df %>%
+  mutate(
+    Cellular_Type = ifelse(grepl("NORMAL", Cellular_Type, ignore.case = TRUE), "Normal",
+                           ifelse(grepl("MUTANT", Cellular_Type, ignore.case = TRUE), "Mutant", Cellular_Type)),
+    Phenotype = factor(Phenotype, levels = c("PEL", "WT")),
+    Cellular_Type = factor(Cellular_Type, levels = c("Normal", "Mutant"))
+  )
+
+# Asegurar columnas esperadas
+needed_cols <- c("Name","Phenotype","Cellular_Type","Area","Circularity","Max_diameter","Min_diameter")
+missing_cols <- setdiff(needed_cols, names(df))
+if (length(missing_cols) > 0) stop(paste("Faltan columnas en el CSV:", paste(missing_cols, collapse=", ")))
+
+# Derivar SampleBase (parte inicial antes del primer "_")
+df <- df %>% mutate(SampleBase = sub("_.*", "", Name))
+
+# ---- Resumen por imagen (Name, dentro de Phenotype & Cellular_Type) ----
+image_summary <- df %>%
+  group_by(SampleBase, Phenotype, Cellular_Type, Name) %>%
+  summarise(
+    cell_count   = n(),
+    mean_area    = mean(Area, na.rm = TRUE),
+    mean_circ    = mean(Circularity, na.rm = TRUE),
+    mean_maxd    = mean(Max_diameter, na.rm = TRUE),
+    mean_mind    = mean(Min_diameter, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# ---- Resumen por muestra base (promedio de imágenes de la misma muestra) ----
+sample_summary <- image_summary %>%
+  group_by(SampleBase, Phenotype, Cellular_Type) %>%
+  summarise(
+    # promedio de promedios por imagen (métrica representativa por muestra)
+    Area_avg = mean(mean_area, na.rm = TRUE),
+    Circ_avg = mean(mean_circ, na.rm = TRUE),
+    MaxD_avg = mean(mean_maxd, na.rm = TRUE),
+    MinD_avg = mean(mean_mind, na.rm = TRUE),
+    total_cells = sum(cell_count),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Group = factor(paste(Phenotype, Cellular_Type, sep = "_"),
+                   levels = c("PEL_Normal","PEL_Mutant","WT_Normal","WT_Mutant"))
+  )
+
+# ---- Preparar variables y mapeos ----
+vars_internal  <- c("Area_avg","Circ_avg","MaxD_avg","MinD_avg","total_cells")
+vars_display   <- c("Area","Circularity","Max_diameter","Min_diameter","Count")
+var_map        <- setNames(vars_display, vars_internal)
+
+# Comparaciones de interés (por pares de niveles del factor Group)
+pairs_list <- list(
+  c("PEL_Normal","PEL_Mutant"),  # PEL: Normal vs Mutant
+  c("WT_Normal","WT_Mutant"),    # WT: Normal vs Mutant
+  c("PEL_Normal","WT_Normal"),   # Normal: PEL vs WT
+  c("PEL_Mutant","WT_Mutant")    # Mutant: PEL vs WT
+)
+pair_labels <- c("PEL: Normal vs Mutant", "WT: Normal vs Mutant", "Normal: PEL vs WT", "Mutant: PEL vs WT")
+pair_label_map <- setNames(pair_labels, sapply(pairs_list, function(x) paste(x, collapse="__")))
+
+# ---- Supuestos: Normalidad (Shapiro) por grupo y Homogeneidad (Levene) por variable ----
+assumptions_normality <- data.frame(Variable=character(), Group=character(), W=numeric(), p_value=numeric())
+assumptions_levene    <- data.frame(Variable=character(), Test=character(), F_value=numeric(), df1=numeric(), df2=numeric(), p_value=numeric())
+
+for (vin in vars_internal) {
+  # Shapiro por grupo (n>=3)
+  for (g in levels(sample_summary$Group)) {
+    vals <- sample_summary %>% filter(Group==g) %>% pull(vin)
+    if (length(vals) >= 3) {
+      sw <- shapiro.test(vals)
+      assumptions_normality <- rbind(assumptions_normality, data.frame(
+        Variable = var_map[[vin]], Group = g, W = unname(sw$statistic), p_value = sw$p.value
+      ))
+    } else {
+      assumptions_normality <- rbind(assumptions_normality, data.frame(
+        Variable = var_map[[vin]], Group = g, W = NA_real_, p_value = NA_real_
+      ))
+    }
+  }
+  # Levene entre los 4 grupos (si hay datos suficientes)
+  lev_p <- tryCatch({
+    lv <- car::leveneTest(as.formula(paste(vin, "~ Group")), data = sample_summary)
+    assumptions_levene <- rbind(assumptions_levene, data.frame(
+      Variable = var_map[[vin]], Test="Levene",
+      F_value = lv$`F value`[1], df1 = lv$Df[1], df2 = lv$Df[2], p_value = lv$`Pr(>F)`[1]
+    ))
+    TRUE
+  }, error = function(e) FALSE)
+  if (!lev_p) {
+    assumptions_levene <- rbind(assumptions_levene, data.frame(
+      Variable = var_map[[vin]], Test="Levene",
+      F_value = NA_real_, df1 = NA_real_, df2 = NA_real_, p_value = NA_real_
+    ))
+  }
+}
+
+assumptions_normality$p_value <- signif(assumptions_normality$p_value, 4)
+assumptions_levene$p_value    <- signif(assumptions_levene$p_value, 4)
+
+# ---- Test global (4 grupos) + post-hoc (Tukey o Dunn) por variable ----
+global_tests <- data.frame(Variable=character(), Method=character(), Stat=numeric(), df1=numeric(), df2=numeric(), p_value=numeric())
+posthoc_all  <- list()      # lista de data.frames por variable (PostHoc completos)
+sig_for_plots_all <- list() # lista de data.frames por variable (solo 4 comparaciones de interés)
+
+for (vin in vars_internal) {
+  vdisp <- var_map[[vin]]
+  # Decidir paramétrico vs no paramétrico: todos los grupos normales y Levene p>0.05
+  sw_p <- assumptions_normality %>% filter(Variable==vdisp) %>% pull(p_value)
+  lev_p <- assumptions_levene %>% filter(Variable==vdisp) %>% pull(p_value)
+  normal_ok <- all(sw_p[!is.na(sw_p)] > 0.05)
+  leve_ok   <- all(lev_p[!is.na(lev_p)] > 0.05)
+  parametric <- normal_ok && leve_ok
+
+  # Test global
+  if (parametric) {
+    aov_mod <- aov(as.formula(paste(vin, "~ Group")), data = sample_summary)
+    aov_sum <- summary(aov_mod)[[1]]
+    statF   <- aov_sum$`F value`[1]; df1 <- aov_sum$Df[1]; df2 <- aov_sum$Df[2]; pval <- aov_sum$`Pr(>F)`[1]
+    global_tests <- rbind(global_tests, data.frame(
+      Variable=vdisp, Method="ANOVA", Stat=statF, df1=df1, df2=df2, p_value=signif(pval,4)
+    ))
+    # Post-hoc Tukey
+    th <- TukeyHSD(aov_mod, "Group")
+    th_df <- as.data.frame(th$Group)
+    th_df$Comparison <- rownames(th$Group)
+    th_df <- th_df %>% 
+      transmute(
+        GroupPair = Comparison,
+        diff = diff, lwr = lwr, upr = upr,
+        p_adj = `p adj`,
+        Method = "Tukey"
+      )
+    # Expandir a columnas group1, group2
+    th_df <- th_df %>%
+      separate(GroupPair, into=c("group1","group2"), sep="-", remove=FALSE)
+    posthoc_all[[vdisp]] <- th_df
+
+    # Filtrar 4 comparaciones deseadas + estrellas
+    sig_rows <- lapply(pairs_list, function(pr){
+      # Buscar fila que coincida sin importar orden
+      m1 <- which(th_df$group1==pr[1] & th_df$group2==pr[2])
+      m2 <- which(th_df$group1==pr[2] & th_df$group2==pr[1])
+      idx <- if (length(m1)>0) m1[1] else if (length(m2)>0) m2[1] else integer(0)
+      if (length(idx)==0) return(data.frame())
+      data.frame(
+        Variable = vdisp,
+        Group1 = pr[1], Group2 = pr[2],
+        ComparisonLabel = pair_label_map[[paste(pr, collapse="__")]],
+        Method = "Tukey",
+        P_adj = th_df$p_adj[idx],
+        Stars = p_to_stars(th_df$p_adj[idx]),
+        stringsAsFactors = FALSE
+      )
+    })
+    sig_for_plots_all[[vdisp]] <- bind_rows(sig_rows)
+
+  } else {
+    # Kruskal + Dunn
+    kw <- kruskal.test(as.formula(paste(vin, "~ Group")), data = sample_summary)
+    global_tests <- rbind(global_tests, data.frame(
+      Variable=vdisp, Method="Kruskal-Wallis", Stat=as.numeric(kw$statistic), df1=as.numeric(kw$parameter), df2=NA, p_value=signif(kw$p.value,4)
+    ))
+    dunn_df <- sample_summary %>%
+      dunn_test(as.formula(paste(vin, "~ Group")), p.adjust.method = "bonferroni") %>%
+      mutate(Method = "Dunn (Bonferroni)") %>%
+      # rstatix::dunn_test da group1, group2, p, p.adj, etc.
+      transmute(
+        GroupPair = paste(group1, group2, sep="-"),
+        group1 = group1, group2 = group2,
+        p_adj = p.adj, Method = Method
+      )
+    posthoc_all[[vdisp]] <- dunn_df %>% rename(Group1 = group1, Group2 = group2)
+
+    # Filtrar 4 comparaciones deseadas + estrellas (sin importar orden)
+    sig_rows <- lapply(pairs_list, function(pr){
+      # Buscar fila que coincida sin importar orden
+      m1 <- which(dunn_df$group1==pr[1] & dunn_df$group2==pr[2])
+      m2 <- which(dunn_df$group1==pr[2] & dunn_df$group2==pr[1])
+      idx <- if (length(m1)>0) m1[1] else if (length(m2)>0) m2[1] else integer(0)
+      if (length(idx)==0) return(data.frame())
+      data.frame(
+        Variable = vdisp,
+        Group1 = pr[1], Group2 = pr[2],
+        ComparisonLabel = pair_label_map[[paste(pr, collapse="__")]],
+        Method = "Dunn (Bonferroni)",
+        P_adj = dunn_df$p_adj[idx],
+        Stars = p_to_stars(dunn_df$p_adj[idx]),
+        stringsAsFactors = FALSE
+      )
+    })
+    sig_for_plots_all[[vdisp]] <- bind_rows(sig_rows)
+  }
+}
+
+# ---- Consolidar significancias para gráficos ----
+significance_used <- bind_rows(sig_for_plots_all) %>%
+  arrange(factor(Variable, levels = vars_display), ComparisonLabel)
+
+# ---- Exportar a Excel ----
+wb <- createWorkbook()
+addWorksheet(wb, "Summary_by_image")
+writeData(wb, "Summary_by_image", image_summary)
+
+addWorksheet(wb, "Summary_by_sample")
+writeData(wb, "Summary_by_sample", sample_summary %>% arrange(Phenotype, SampleBase, Cellular_Type))
+
+addWorksheet(wb, "Assumptions_Normality")
+writeData(wb, "Assumptions_Normality", assumptions_normality %>% arrange(Variable, Group))
+
+addWorksheet(wb, "Assumptions_Levene")
+writeData(wb, "Assumptions_Levene", assumptions_levene %>% arrange(Variable))
+
+addWorksheet(wb, "Global_Test")
+writeData(wb, "Global_Test", global_tests %>% arrange(factor(Variable, levels = vars_display)))
+
+# PostHoc por variable
+for (vdisp in vars_display) {
+  addWorksheet(wb, paste0("PostHoc_", vdisp))
+  ph <- posthoc_all[[vdisp]]
+  if (!is.null(ph)) {
+    writeData(wb, paste0("PostHoc_", vdisp), ph)
+  } else {
+    writeData(wb, paste0("PostHoc_", vdisp), data.frame(Mensaje="Sin resultados post-hoc"))
+  }
+}
+
+addWorksheet(wb, "Sig_for_plots")
+writeData(wb, "Sig_for_plots", significance_used)
+
+saveWorkbook(wb, file.path(out_dir, "RESULTS_ANALYSIS_COMPLETE.xlsx"), overwrite = TRUE)
+
+# ---- Gráficos (SVG/JPG) ----
+# Función genérica para violin + boxplot por variable, con 4 comparaciones anotadas
+plot_violin_with_signif <- function(var_internal, var_label){
+  d <- sample_summary %>%
+    select(Group, Phenotype, Cellular_Type, value = all_of(var_internal)) %>%
+    mutate(Group = factor(Group, levels = c("PEL_Normal","PEL_Mutant","WT_Normal","WT_Mutant")))
+
+  # Preparar anotaciones (comparisons & labels) desde 'significance_used'
+  sig_df <- significance_used %>% filter(Variable==var_label)
+  comps <- pairs_list
+  labels <- sapply(seq_along(comps), function(i){
+    pr <- comps[[i]]
+    row <- sig_df %>% filter((Group1==pr[1] & Group2==pr[2]) | (Group1==pr[2] & Group2==pr[1]))
+    if (nrow(row)==0) "n.s." else row$Stars[1]
+  })
+  ymax <- max(d$value, na.rm = TRUE)
+  ypos <- seq(ymax*1.10, by = ymax*0.07, length.out = length(comps))
+
+  p <- ggplot(d, aes(x = Group, y = value, fill = Group)) +
+    geom_violin(alpha = 0.3, trim = TRUE) +
+    geom_boxplot(width = 0.15, outlier.shape = 16, outlier.size = 1.2) +
+    theme_classic(base_size = 13) +
+    theme(axis.text.x = element_text(angle = 30, hjust = 1)) +
+    labs(title = paste0(var_label, " by Phenotype & Cell Type"),
+         x = "Group", y = var_label) +
+    geom_signif(comparisons = comps, annotations = labels,
+                y_position = ypos, tip_length = 0.01, textsize = 4, vjust = 0.3)
+  p
+}
+
+# Funciones para gráficos separados por fenotipo o por tipo
+plot_within_phenotype <- function(var_internal, var_label, pheno){
+  d <- sample_summary %>%
+    filter(Phenotype==pheno) %>%
+    select(Phenotype, Cellular_Type, value = all_of(var_internal)) %>%
+    mutate(Cellular_Type = factor(Cellular_Type, levels = c("Normal","Mutant")))
+  # etiqueta
+  row <- significance_used %>% filter(Variable==var_label, ComparisonLabel==paste0(pheno, ": Normal vs Mutant"))
+  lab <- if (nrow(row)==0) "n.s." else row$Stars[1]
+  ymax <- max(d$value, na.rm = TRUE)
+  p <- ggplot(d, aes(x = Cellular_Type, y = value, fill = Cellular_Type)) +
+    geom_violin(alpha=0.3, trim=TRUE) +
+    geom_boxplot(width=0.15, outlier.shape = 16, outlier.size = 1.2) +
+    theme_classic(base_size = 13) +
+    labs(title=paste0(var_label, " - ", pheno, " (Normal vs Mutant)"),
+         x="Cell Type", y=var_label) +
+    geom_signif(comparisons = list(c("Normal","Mutant")), annotations = lab,
+                y_position = ymax*1.10, tip_length = 0.01, textsize = 4, vjust = 0.3)
+  p
+}
+
+plot_within_celltype <- function(var_internal, var_label, ctype){
+  d <- sample_summary %>%
+    filter(Cellular_Type==ctype) %>%
+    select(Phenotype, Cellular_Type, value = all_of(var_internal)) %>%
+    mutate(Phenotype = factor(Phenotype, levels = c("PEL","WT")))
+  # etiqueta
+  key <- if (ctype=="Normal") "Normal: PEL vs WT" else "Mutant: PEL vs WT"
+  row <- significance_used %>% filter(Variable==var_label, ComparisonLabel==key)
+  lab <- if (nrow(row)==0) "n.s." else row$Stars[1]
+  ymax <- max(d$value, na.rm = TRUE)
+  p <- ggplot(d, aes(x = Phenotype, y = value, fill = Phenotype)) +
+    geom_violin(alpha=0.3, trim=TRUE) +
+    geom_boxplot(width=0.15, outlier.shape = 16, outlier.size = 1.2) +
+    theme_classic(base_size = 13) +
+    labs(title=paste0(var_label, " - ", ctype, " (PEL vs WT)"),
+         x="Phenotype", y=var_label) +
+    geom_signif(comparisons = list(c("PEL","WT")), annotations = lab,
+                y_position = ymax*1.10, tip_length = 0.01, textsize = 4, vjust = 0.3)
+  p
+}
+
+# Generar y guardar todos los gráficos para cada variable
+for (vin in vars_internal) {
+  vlabel <- var_map[[vin]]
+
+  # 1) Combinado 4 grupos
+  p_all <- plot_violin_with_signif(vin, vlabel)
+  ggsave(file.path(out_dir, paste0("Violin_", vlabel, "_All.svg")), p_all, width=7, height=6)
+  ggsave(file.path(out_dir, paste0("Violin_", vlabel, "_All.jpg")), p_all, width=7, height=6, dpi=300)
+
+  # 2) Dentro de cada fenotipo (PEL / WT): Normal vs Mutant
+  for (ph in c("PEL","WT")) {
+    p_ph <- plot_within_phenotype(vin, vlabel, ph)
+    ggsave(file.path(out_dir, paste0("Violin_", vlabel, "_", ph, "_Normal_vs_Mutant.svg")), p_ph, width=7, height=6)
+    ggsave(file.path(out_dir, paste0("Violin_", vlabel, "_", ph, "_Normal_vs_Mutant.jpg")), p_ph, width=7, height=6, dpi=300)
+  }
+
+  # 3) Dentro de cada tipo (Normal / Mutant): PEL vs WT
+  for (ct in c("Normal","Mutant")) {
+    p_ct <- plot_within_celltype(vin, vlabel, ct)
+    ggsave(file.path(out_dir, paste0("Violin_", vlabel, "_", ct, "_PEL_vs_WT.svg")), p_ct, width=7, height=6)
+    ggsave(file.path(out_dir, paste0("Violin_", vlabel, "_", ct, "_PEL_vs_WT.jpg")), p_ct, width=7, height=6, dpi=300)
+  }
+}
+
+## ---- Gráfico de barras con error estándar ----
+counts_stats <- sample_summary %>%
+  group_by(Phenotype, Cellular_Type) %>%
+  summarise(
+    mean_cells = mean(total_cells, na.rm = TRUE),
+    sd_cells   = sd(total_cells, na.rm = TRUE),
+    n          = n(),
+    sem        = sd_cells / sqrt(n),
+    .groups = "drop"
+  )
+
+# Extraer significancias igual que antes
+lab_count_pel  <- significance_used %>% filter(Variable=="Count", ComparisonLabel=="PEL: Normal vs Mutant")   %>% pull(Stars); if (!length(lab_count_pel))  lab_count_pel  <- "n.s."
+lab_count_wt   <- significance_used %>% filter(Variable=="Count", ComparisonLabel=="WT: Normal vs Mutant")    %>% pull(Stars); if (!length(lab_count_wt))   lab_count_wt   <- "n.s."
+lab_count_norm <- significance_used %>% filter(Variable=="Count", ComparisonLabel=="Normal: PEL vs WT")       %>% pull(Stars); if (!length(lab_count_norm)) lab_count_norm <- "n.s."
+lab_count_mut  <- significance_used %>% filter(Variable=="Count", ComparisonLabel=="Mutant: PEL vs WT")       %>% pull(Stars); if (!length(lab_count_mut))  lab_count_mut  <- "n.s."
+
+# Alturas para brackets (ajustadas al máximo + margen)
+y_max  <- max(counts_stats$mean_cells + counts_stats$sem, na.rm = TRUE)
+y_pel  <- y_max * 1.05
+y_wt   <- y_max * 1.20
+y_norm <- y_max * 1.35
+y_mut  <- y_max * 1.50
+
+# Gráfico
+p_counts <- ggplot(counts_stats, aes(x = Phenotype, y = mean_cells, fill = Cellular_Type)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  geom_errorbar(aes(ymin = mean_cells - sem, ymax = mean_cells + sem),
+                width = 0.2, position = position_dodge(width = 0.8)) +
+  geom_text(aes(label = round(mean_cells,1)),
+            position = position_dodge(width = 0.8),
+            vjust = -0.5, size = 3.5) +
+  theme_classic(base_size = 13) +
+  labs(title = "Cell Count by Phenotype and Cell Type (mean ± SEM)",
+       x = "Phenotype", y = "Number of Cells", fill = "Cell Type") +
+  scale_y_continuous(expand = expansion(mult = c(0.02, 0.25))) +
+  coord_cartesian(clip = "off")
+
+# Brackets manuales
+p_counts <- p_counts +
+  # PEL (Normal vs Mutant)
+  annotate("segment", x = 0.8, xend = 1.2, y = y_pel, yend = y_pel) +
+  annotate("segment", x = 0.8, xend = 0.8, y = y_pel, yend = y_pel - y_max*0.02) +
+  annotate("segment", x = 1.2, xend = 1.2, y = y_pel, yend = y_pel - y_max*0.02) +
+  annotate("text", x = 1.0, y = y_pel + y_max*0.02, label = lab_count_pel, size = 4) +
+
+  # WT (Normal vs Mutant)
+  annotate("segment", x = 1.8, xend = 2.2, y = y_wt, yend = y_wt) +
+  annotate("segment", x = 1.8, xend = 1.8, y = y_wt, yend = y_wt - y_max*0.02) +
+  annotate("segment", x = 2.2, xend = 2.2, y = y_wt, yend = y_wt - y_max*0.02) +
+  annotate("text", x = 2.0, y = y_wt + y_max*0.02, label = lab_count_wt, size = 4) +
+
+  # Normal (PEL vs WT)
+  annotate("segment", x = 0.8, xend = 1.8, y = y_norm, yend = y_norm) +
+  annotate("segment", x = 0.8, xend = 0.8, y = y_norm, yend = y_norm - y_max*0.02) +
+  annotate("segment", x = 1.8, xend = 1.8, y = y_norm, yend = y_norm - y_max*0.02) +
+  annotate("text", x = 1.3, y = y_norm + y_max*0.02, label = lab_count_norm, size = 4) +
+
+  # Mutant (PEL vs WT)
+  annotate("segment", x = 1.2, xend = 2.2, y = y_mut, yend = y_mut) +
+  annotate("segment", x = 1.2, xend = 1.2, y = y_mut, yend = y_mut - y_max*0.02) +
+  annotate("segment", x = 2.2, xend = 2.2, y = y_mut, yend = y_mut - y_max*0.02) +
+  annotate("text", x = 1.7, y = y_mut + y_max*0.02, label = lab_count_mut, size = 4)
+
+# Guardar
+ggsave(file.path(out_dir, "Bar_CellCount_AllComparisons_SEM.svg"), p_counts, width=7, height=6)
+ggsave(file.path(out_dir, "Bar_CellCount_AllComparisons_SEM.jpg"), p_counts, width=7, height=6, dpi=300)
+
+# ---- Mensaje final de ruta de salida ----
+cat("\nListo. Resultados y gráficos guardados en: ", normalizePath(out_dir), "\n")
+
+```
+
+
+#FINAL 20250826_TYPES
+```{r}
+# ============================================================
+# Análisis completo de fenotipo (PEL vs WT) y tipo celular (Normal vs Mutant)
+# - Lee "types_combined_FILTERED.csv"
+# - Resume por imagen (Name) y luego por muestra base (SampleBase)
+# - Evalúa normalidad (Shapiro) y homogeneidad (Levene)
+# - Test global (ANOVA o Kruskal) y post-hoc (Tukey o Dunn)
+# - Extrae 4 comparaciones de interés y genera significancias (***, **, *, n.s.)
+# - Exporta TODO a Excel (incluye hojas para conteos medios±SEM y totales)
+# - Genera gráficos (SVG/JPG):
+#     * Violín+boxplot (4 grupos) y vistas dentro de fenotipo o tipo
+#     * Barras de conteo medio±SEM (con significancia) y barras de conteo total (con significancia)
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(ggsignif)
+  library(openxlsx)
+  library(car)
+  library(rstatix)   # dunn_test
+  library(readr)
+})
+
+# ---------- Config ----------
+out_dir   <- "outputs_analysis"
+if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+
+# ---------- Utilidades ----------
+p_to_stars <- function(p){
+  if (is.na(p)) return("n.s.")
+  if (p < 0.001) return("***")
+  if (p < 0.01)  return("**")
+  if (p < 0.05)  return("*")
+  "n.s."
+}
+
+# ---------- Lectura y limpieza ----------
+df <- types_combined_FILTERED
+
+# quitar cualquier columna "Length"
+df <- df %>% select(-matches("^Length$|^Length\\b", ignore.case = TRUE))
+
+# normalizar etiquetas
+df <- df %>%
+  mutate(
+    Cellular_Type = ifelse(grepl("NORMAL", Cellular_Type, ignore.case = TRUE), "Normal",
+                           ifelse(grepl("MUTANT", Cellular_Type, ignore.case = TRUE), "Mutant", Cellular_Type)),
+    Phenotype = factor(Phenotype, levels = c("PEL", "WT")),
+    Cellular_Type = factor(Cellular_Type, levels = c("Normal", "Mutant"))
+  )
+
+needed_cols <- c("Name","Phenotype","Cellular_Type","Area","Circularity","Max_diameter","Min_diameter")
+missing_cols <- setdiff(needed_cols, names(df))
+if (length(missing_cols) > 0) stop(paste("Faltan columnas en el CSV:", paste(missing_cols, collapse=", ")))
+
+# muestra base = prefijo antes del primer "_"
+df <- df %>% mutate(SampleBase = sub("_.*", "", Name))
+
+# ---------- Resumen por IMAGEN ----------
+image_summary <- df %>%
+  group_by(SampleBase, Phenotype, Cellular_Type, Name) %>%
+  summarise(
+    cell_count   = n(),
+    mean_area    = mean(Area, na.rm = TRUE),
+    mean_circ    = mean(Circularity, na.rm = TRUE),
+    mean_maxd    = mean(Max_diameter, na.rm = TRUE),
+    mean_mind    = mean(Min_diameter, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# ---------- Resumen por MUESTRA (promedio de imágenes de la misma muestra) ----------
+sample_summary <- image_summary %>%
+  group_by(SampleBase, Phenotype, Cellular_Type) %>%
+  summarise(
+    Area_avg = mean(mean_area, na.rm = TRUE),
+    Circ_avg = mean(mean_circ, na.rm = TRUE),
+    MaxD_avg = mean(mean_maxd, na.rm = TRUE),
+    MinD_avg = mean(mean_mind, na.rm = TRUE),
+    total_cells = sum(cell_count),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Group = factor(paste(Phenotype, Cellular_Type, sep = "_"),
+                   levels = c("PEL_Normal","PEL_Mutant","WT_Normal","WT_Mutant"))
+  )
+
+# ---------- Variables y comparaciones ----------
+vars_internal <- c("Area_avg","Circ_avg","MaxD_avg","MinD_avg","total_cells")
+vars_display  <- c("Area","Circularity","Max_diameter","Min_diameter","Count")
+var_map       <- setNames(vars_display, vars_internal)
+
+pairs_list <- list(
+  c("PEL_Normal","PEL_Mutant"),
+  c("WT_Normal","WT_Mutant"),
+  c("PEL_Normal","WT_Normal"),
+  c("PEL_Mutant","WT_Mutant")
+)
+pair_labels <- c("PEL: Normal vs Mutant", "WT: Normal vs Mutant", "Normal: PEL vs WT", "Mutant: PEL vs WT")
+pair_label_map <- setNames(pair_labels, sapply(pairs_list, function(x) paste(x, collapse="__")))
+
+# ---------- Supuestos ----------
+assumptions_normality <- data.frame(Variable=character(), Group=character(), W=numeric(), p_value=numeric())
+assumptions_levene    <- data.frame(Variable=character(), Test=character(), F_value=numeric(), df1=numeric(), df2=numeric(), p_value=numeric())
+
+for (vin in vars_internal) {
+  # Shapiro por grupo
+  for (g in levels(sample_summary$Group)) {
+    vals <- sample_summary %>% filter(Group==g) %>% pull(vin)
+    if (length(vals) >= 3) {
+      sw <- shapiro.test(vals)
+      assumptions_normality <- rbind(assumptions_normality, data.frame(
+        Variable = var_map[[vin]], Group = g, W = unname(sw$statistic), p_value = sw$p.value
+      ))
+    } else {
+      assumptions_normality <- rbind(assumptions_normality, data.frame(
+        Variable = var_map[[vin]], Group = g, W = NA_real_, p_value = NA_real_
+      ))
+    }
+  }
+  # Levene
+  ok <- tryCatch({
+    lv <- car::leveneTest(as.formula(paste(vin, "~ Group")), data = sample_summary)
+    assumptions_levene <- rbind(assumptions_levene, data.frame(
+      Variable = var_map[[vin]], Test="Levene",
+      F_value = lv$`F value`[1], df1 = lv$Df[1], df2 = lv$Df[2], p_value = lv$`Pr(>F)`[1]
+    ))
+    TRUE
+  }, error = function(e) FALSE)
+  if (!ok) {
+    assumptions_levene <- rbind(assumptions_levene, data.frame(
+      Variable = var_map[[vin]], Test="Levene",
+      F_value = NA_real_, df1 = NA_real_, df2 = NA_real_, p_value = NA_real_
+    ))
+  }
+}
+assumptions_normality$p_value <- signif(assumptions_normality$p_value, 4)
+assumptions_levene$p_value    <- signif(assumptions_levene$p_value, 4)
+
+# ---------- Test global + Post-hoc ----------
+global_tests <- data.frame(Variable=character(), Method=character(), Stat=numeric(), df1=numeric(), df2=numeric(), p_value=numeric())
+posthoc_all  <- list()
+sig_for_plots_all <- list()
+
+for (vin in vars_internal) {
+  vdisp <- var_map[[vin]]
+  sw_ps <- assumptions_normality %>% filter(Variable==vdisp) %>% pull(p_value)
+  lev_p <- assumptions_levene %>% filter(Variable==vdisp) %>% pull(p_value)
+  parametric <- all(sw_ps[!is.na(sw_ps)] > 0.05) && all(lev_p[!is.na(lev_p)] > 0.05)
+
+  if (parametric) {
+    aov_mod <- aov(as.formula(paste(vin, "~ Group")), data = sample_summary)
+    aov_sum <- summary(aov_mod)[[1]]
+    global_tests <- rbind(global_tests, data.frame(
+      Variable=vdisp, Method="ANOVA",
+      Stat=aov_sum$`F value`[1], df1=aov_sum$Df[1], df2=aov_sum$Df[2],
+      p_value=signif(aov_sum$`Pr(>F)`[1],4)
+    ))
+    th <- TukeyHSD(aov_mod, "Group")
+    th_df <- as.data.frame(th$Group)
+    th_df$Comparison <- rownames(th$Group)
+    th_df <- th_df %>%
+      transmute(GroupPair = Comparison, diff = diff, lwr = lwr, upr = upr,
+                p_adj = `p adj`, Method = "Tukey") %>%
+      separate(GroupPair, into=c("group1","group2"), sep="-", remove=FALSE)
+    posthoc_all[[vdisp]] <- th_df
+    sig_rows <- lapply(pairs_list, function(pr){
+      m1 <- which(th_df$group1==pr[1] & th_df$group2==pr[2])
+      m2 <- which(th_df$group1==pr[2] & th_df$group2==pr[1])
+      idx <- if (length(m1)>0) m1[1] else if (length(m2)>0) m2[1] else integer(0)
+      if (!length(idx)) return(data.frame())
+      data.frame(Variable=vdisp, Group1=pr[1], Group2=pr[2],
+                 ComparisonLabel=pair_label_map[[paste(pr, collapse="__")]],
+                 Method="Tukey", P_adj=th_df$p_adj[idx], Stars=p_to_stars(th_df$p_adj[idx]))
+    })
+    sig_for_plots_all[[vdisp]] <- bind_rows(sig_rows)
+  } else {
+    kw <- kruskal.test(as.formula(paste(vin, "~ Group")), data = sample_summary)
+    global_tests <- rbind(global_tests, data.frame(
+      Variable=vdisp, Method="Kruskal-Wallis",
+      Stat=as.numeric(kw$statistic), df1=as.numeric(kw$parameter), df2=NA, p_value=signif(kw$p.value,4)
+    ))
+    dunn_df <- sample_summary %>%
+      dunn_test(as.formula(paste(vin, "~ Group")), p.adjust.method = "bonferroni") %>%
+      mutate(Method = "Dunn (Bonferroni)") %>%
+      transmute(GroupPair = paste(group1, group2, sep="-"),
+                group1 = group1, group2 = group2, p_adj = p.adj, Method = Method)
+    posthoc_all[[vdisp]] <- dunn_df %>% rename(group1 = group1, group2 = group2)
+    sig_rows <- lapply(pairs_list, function(pr){
+      m1 <- which(dunn_df$group1==pr[1] & dunn_df$group2==pr[2])
+      m2 <- which(dunn_df$group1==pr[2] & dunn_df$group2==pr[1])
+      idx <- if (length(m1)>0) m1[1] else if (length(m2)>0) m2[1] else integer(0)
+      if (!length(idx)) return(data.frame())
+      data.frame(Variable=vdisp, Group1=pr[1], Group2=pr[2],
+                 ComparisonLabel=pair_label_map[[paste(pr, collapse="__")]],
+                 Method="Dunn (Bonferroni)", P_adj=dunn_df$p_adj[idx], Stars=p_to_stars(dunn_df$p_adj[idx]))
+    })
+    sig_for_plots_all[[vdisp]] <- bind_rows(sig_rows)
+  }
+}
+
+significance_used <- bind_rows(sig_for_plots_all) %>%
+  arrange(factor(Variable, levels = vars_display), ComparisonLabel)
+
+# ---------- Excel (se añaden hojas extra al final) ----------
+wb <- createWorkbook()
+addWorksheet(wb, "Summary_by_image");  writeData(wb, "Summary_by_image", image_summary)
+addWorksheet(wb, "Summary_by_sample"); writeData(wb, "Summary_by_sample", sample_summary %>% arrange(Phenotype, SampleBase, Cellular_Type))
+addWorksheet(wb, "Assumptions_Normality"); writeData(wb, "Assumptions_Normality", assumptions_normality %>% arrange(Variable, Group))
+addWorksheet(wb, "Assumptions_Levene");    writeData(wb, "Assumptions_Levene", assumptions_levene %>% arrange(Variable))
+addWorksheet(wb, "Global_Test");           writeData(wb, "Global_Test", global_tests %>% arrange(factor(Variable, levels = vars_display)))
+
+for (vdisp in vars_display) {
+  addWorksheet(wb, paste0("PostHoc_", vdisp))
+  ph <- posthoc_all[[vdisp]]
+  if (!is.null(ph)) writeData(wb, paste0("PostHoc_", vdisp), ph) else
+    writeData(wb, paste0("PostHoc_", vdisp), data.frame(Mensaje="Sin resultados post-hoc"))
+}
+addWorksheet(wb, "Sig_for_plots"); writeData(wb, "Sig_for_plots", significance_used)
+
+# ---------- Gráficos: funciones de violín ----------
+plot_violin_with_signif <- function(var_internal, var_label){
+  d <- sample_summary %>%
+    select(Group, Phenotype, Cellular_Type, value = all_of(var_internal)) %>%
+    mutate(Group = factor(Group, levels = c("PEL_Normal","PEL_Mutant","WT_Normal","WT_Mutant")))
+  sig_df <- significance_used %>% filter(Variable==var_label)
+  comps <- pairs_list
+  labels <- sapply(seq_along(comps), function(i){
+    pr <- comps[[i]]
+    row <- sig_df %>% filter((Group1==pr[1] & Group2==pr[2]) | (Group1==pr[2] & Group2==pr[1]))
+    if (nrow(row)==0) "n.s." else row$Stars[1]
+  })
+  ymax <- max(d$value, na.rm = TRUE)
+  ypos <- seq(ymax*1.10, by = ymax*0.07, length.out = length(comps))
+  ggplot(d, aes(x = Group, y = value, fill = Group)) +
+    geom_violin(alpha = 0.3, trim = TRUE) +
+    geom_boxplot(width = 0.15, outlier.shape = 16, outlier.size = 1.2) +
+    theme_classic(base_size = 13) +
+    theme(axis.text.x = element_text(angle = 30, hjust = 1)) +
+    labs(title = paste0(var_label, " by Phenotype & Cell Type"),
+         x = "Group", y = var_label) +
+    geom_signif(comparisons = comps, annotations = labels,
+                y_position = ypos, tip_length = 0.01, textsize = 4, vjust = 0.3)
+}
+
+plot_within_phenotype <- function(var_internal, var_label, pheno){
+  d <- sample_summary %>%
+    filter(Phenotype==pheno) %>%
+    select(Phenotype, Cellular_Type, value = all_of(var_internal)) %>%
+    mutate(Cellular_Type = factor(Cellular_Type, levels = c("Normal","Mutant")))
+  row <- significance_used %>% filter(Variable==var_label, ComparisonLabel==paste0(pheno, ": Normal vs Mutant"))
+  lab <- if (nrow(row)==0) "n.s." else row$Stars[1]
+  ymax <- max(d$value, na.rm = TRUE)
+  ggplot(d, aes(x = Cellular_Type, y = value, fill = Cellular_Type)) +
+    geom_violin(alpha=0.3, trim=TRUE) +
+    geom_boxplot(width=0.15, outlier.shape = 16, outlier.size = 1.2) +
+    theme_classic(base_size = 13) +
+    labs(title=paste0(var_label, " - ", pheno, " (Normal vs Mutant)"),
+         x="Cell Type", y=var_label) +
+    geom_signif(comparisons = list(c("Normal","Mutant")), annotations = lab,
+                y_position = ymax*1.10, tip_length = 0.01, textsize = 4, vjust = 0.3)
+}
+
+plot_within_celltype <- function(var_internal, var_label, ctype){
+  d <- sample_summary %>%
+    filter(Cellular_Type==ctype) %>%
+    select(Phenotype, Cellular_Type, value = all_of(var_internal)) %>%
+    mutate(Phenotype = factor(Phenotype, levels = c("PEL","WT")))
+  key <- if (ctype=="Normal") "Normal: PEL vs WT" else "Mutant: PEL vs WT"
+  row <- significance_used %>% filter(Variable==var_label, ComparisonLabel==key)
+  lab <- if (nrow(row)==0) "n.s." else row$Stars[1]
+  ymax <- max(d$value, na.rm = TRUE)
+  ggplot(d, aes(x = Phenotype, y = value, fill = Phenotype)) +
+    geom_violin(alpha=0.3, trim=TRUE) +
+    geom_boxplot(width=0.15, outlier.shape = 16, outlier.size = 1.2) +
+    theme_classic(base_size = 13) +
+    labs(title=paste0(var_label, " - ", ctype, " (PEL vs WT)"),
+         x="Phenotype", y=var_label) +
+    geom_signif(comparisons = list(c("PEL","WT")), annotations = lab,
+                y_position = ymax*1.10, tip_length = 0.01, textsize = 4, vjust = 0.3)
+}
+
+# Guardar gráficos violín
+for (vin in vars_internal) {
+  vlabel <- var_map[[vin]]
+  p_all <- plot_violin_with_signif(vin, vlabel)
+  ggsave(file.path(out_dir, paste0("Violin_", vlabel, "_All.svg")), p_all, width=7, height=6)
+  ggsave(file.path(out_dir, paste0("Violin_", vlabel, "_All.jpg")), p_all, width=7, height=6, dpi=300)
+  for (ph in c("PEL","WT")) {
+    p_ph <- plot_within_phenotype(vin, vlabel, ph)
+    ggsave(file.path(out_dir, paste0("Violin_", vlabel, "_", ph, "_Normal_vs_Mutant.svg")), p_ph, width=7, height=6)
+    ggsave(file.path(out_dir, paste0("Violin_", vlabel, "_", ph, "_Normal_vs_Mutant.jpg")), p_ph, width=7, height=6, dpi=300)
+  }
+  for (ct in c("Normal","Mutant")) {
+    p_ct <- plot_within_celltype(vin, vlabel, ct)
+    ggsave(file.path(out_dir, paste0("Violin_", vlabel, "_", ct, "_PEL_vs_WT.svg")), p_ct, width=7, height=6)
+    ggsave(file.path(out_dir, paste0("Violin_", vlabel, "_", ct, "_PEL_vs_WT.jpg")), p_ct, width=7, height=6, dpi=300)
+  }
+}
+
+# ---------- Barras 1: medias ± SEM (con significancia) ----------
+counts_stats <- sample_summary %>%
+  group_by(Phenotype, Cellular_Type) %>%
+  summarise(
+    mean_cells = mean(total_cells, na.rm = TRUE),
+    sd_cells   = sd(total_cells, na.rm = TRUE),
+    n          = n(),
+    sem        = sd_cells / sqrt(n),
+    .groups = "drop"
+  )
+
+# etiquetas de significancia (variable "Count")
+lab_count_pel  <- significance_used %>% filter(Variable=="Count", ComparisonLabel=="PEL: Normal vs Mutant")   %>% pull(Stars); if (!length(lab_count_pel))  lab_count_pel  <- "n.s."
+lab_count_wt   <- significance_used %>% filter(Variable=="Count", ComparisonLabel=="WT: Normal vs Mutant")    %>% pull(Stars); if (!length(lab_count_wt))   lab_count_wt   <- "n.s."
+lab_count_norm <- significance_used %>% filter(Variable=="Count", ComparisonLabel=="Normal: PEL vs WT")       %>% pull(Stars); if (!length(lab_count_norm)) lab_count_norm <- "n.s."
+lab_count_mut  <- significance_used %>% filter(Variable=="Count", ComparisonLabel=="Mutant: PEL vs WT")       %>% pull(Stars); if (!length(lab_count_mut))  lab_count_mut  <- "n.s."
+
+y_max  <- max(counts_stats$mean_cells + counts_stats$sem, na.rm = TRUE)
+y_pel  <- y_max * 1.05
+y_wt   <- y_max * 1.20
+y_norm <- y_max * 1.35
+y_mut  <- y_max * 1.50
+
+p_counts_mean <- ggplot(counts_stats, aes(x = Phenotype, y = mean_cells, fill = Cellular_Type)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  geom_errorbar(aes(ymin = mean_cells - sem, ymax = mean_cells + sem),
+                width = 0.2, position = position_dodge(width = 0.8)) +
+  theme_classic(base_size = 13) +
+  labs(title = "Cell Count by Phenotype and Cell Type (mean ± SEM)",
+       x = "Phenotype", y = "Number of Cells", fill = "Cell Type") +
+  scale_y_continuous(expand = expansion(mult = c(0.02, 0.30))) +
+  coord_cartesian(clip = "off") +
+  # Brackets manuales (PEL, WT, Normal, Mutant)
+  annotate("segment", x = 0.8, xend = 1.2, y = y_pel, yend = y_pel) +
+  annotate("segment", x = 0.8, xend = 0.8, y = y_pel, yend = y_pel - y_max*0.02) +
+  annotate("segment", x = 1.2, xend = 1.2, y = y_pel, yend = y_pel - y_max*0.02) +
+  annotate("text",    x = 1.0, y = y_pel + y_max*0.02, label = lab_count_pel, size = 4) +
+  annotate("segment", x = 1.8, xend = 2.2, y = y_wt, yend = y_wt) +
+  annotate("segment", x = 1.8, xend = 1.8, y = y_wt, yend = y_wt - y_max*0.02) +
+  annotate("segment", x = 2.2, xend = 2.2, y = y_wt, yend = y_wt - y_max*0.02) +
+  annotate("text",    x = 2.0, y = y_wt + y_max*0.02, label = lab_count_wt, size = 4) +
+  annotate("segment", x = 0.8, xend = 1.8, y = y_norm, yend = y_norm) +
+  annotate("segment", x = 0.8, xend = 0.8, y = y_norm, yend = y_norm - y_max*0.02) +
+  annotate("segment", x = 1.8, xend = 1.8, y = y_norm, yend = y_norm - y_max*0.02) +
+  annotate("text",    x = 1.3, y = y_norm + y_max*0.02, label = lab_count_norm, size = 4) +
+  annotate("segment", x = 1.2, xend = 2.2, y = y_mut, yend = y_mut) +
+  annotate("segment", x = 1.2, xend = 1.2, y = y_mut, yend = y_mut - y_max*0.02) +
+  annotate("segment", x = 2.2, xend = 2.2, y = y_mut, yend = y_mut - y_max*0.02) +
+  annotate("text",    x = 1.7, y = y_mut + y_max*0.02, label = lab_count_mut, size = 4)
+
+ggsave(file.path(out_dir, "Bar_CellCount_MeanSEM_AllComparisons.svg"), p_counts_mean, width=7, height=6)
+ggsave(file.path(out_dir, "Bar_CellCount_MeanSEM_AllComparisons.jpg"), p_counts_mean, width=7, height=6, dpi=300)
+
+# ---------- Barras 2: conteo TOTAL por grupo (con significancia) ----------
+counts_totals <- sample_summary %>%
+  group_by(Phenotype, Cellular_Type) %>%
+  summarise(TotalCells = sum(total_cells), .groups = "drop")
+
+y2_max  <- max(counts_totals$TotalCells, na.rm = TRUE)
+y2_pel  <- y2_max * 1.05
+y2_wt   <- y2_max * 1.20
+y2_norm <- y2_max * 1.35
+y2_mut  <- y2_max * 1.50
+
+p_counts_total <- ggplot(counts_totals, aes(x = Phenotype, y = TotalCells, fill = Cellular_Type)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  theme_classic(base_size = 13) +
+  labs(title = "Total Cell Count by Phenotype and Cell Type",
+       x = "Phenotype", y = "Total Cells", fill = "Cell Type") +
+  scale_y_continuous(expand = expansion(mult = c(0.02, 0.30))) +
+  coord_cartesian(clip = "off") +
+  annotate("segment", x = 0.8, xend = 1.2, y = y2_pel, yend = y2_pel) +
+  annotate("segment", x = 0.8, xend = 0.8, y = y2_pel, yend = y2_pel - y2_max*0.02) +
+  annotate("segment", x = 1.2, xend = 1.2, y = y2_pel, yend = y2_pel - y2_max*0.02) +
+  annotate("text",    x = 1.0, y = y2_pel + y2_max*0.02, label = lab_count_pel, size = 4) +
+  annotate("segment", x = 1.8, xend = 2.2, y = y2_wt, yend = y2_wt) +
+  annotate("segment", x = 1.8, xend = 1.8, y = y2_wt, yend = y2_wt - y2_max*0.02) +
+  annotate("segment", x = 2.2, xend = 2.2, y = y2_wt, yend = y2_wt - y2_max*0.02) +
+  annotate("text",    x = 2.0, y = y2_wt + y2_max*0.02, label = lab_count_wt, size = 4) +
+  annotate("segment", x = 0.8, xend = 1.8, y = y2_norm, yend = y2_norm) +
+  annotate("segment", x = 0.8, xend = 0.8, y = y2_norm, yend = y2_norm - y2_max*0.02) +
+  annotate("segment", x = 1.8, xend = 1.8, y = y2_norm, yend = y2_norm - y2_max*0.02) +
+  annotate("text",    x = 1.3, y = y2_norm + y2_max*0.02, label = lab_count_norm, size = 4) +
+  annotate("segment", x = 1.2, xend = 2.2, y = y2_mut, yend = y2_mut) +
+  annotate("segment", x = 1.2, xend = 1.2, y = y2_mut, yend = y2_mut - y2_max*0.02) +
+  annotate("segment", x = 2.2, xend = 2.2, y = y2_mut, yend = y2_mut - y2_max*0.02) +
+  annotate("text",    x = 1.7, y = y2_mut + y2_max*0.02, label = lab_count_mut, size = 4)
+
+ggsave(file.path(out_dir, "Bar_CellCount_Totals_AllComparisons.svg"), p_counts_total, width=7, height=6)
+ggsave(file.path(out_dir, "Bar_CellCount_Totals_AllComparisons.jpg"), p_counts_total, width=7, height=6, dpi=300)
+
+# ---------- Añadir hojas de conteos al Excel y guardar ----------
+addWorksheet(wb, "Counts_mean_SEM");  writeData(wb, "Counts_mean_SEM", counts_stats %>% arrange(Phenotype, Cellular_Type))
+addWorksheet(wb, "Counts_Totals_Sum"); writeData(wb, "Counts_Totals_Sum", counts_totals %>% arrange(Phenotype, Cellular_Type))
+
+saveWorkbook(wb, file.path(out_dir, "RESULTS_ANALYSIS_COMPLETE.xlsx"), overwrite = TRUE)
+
+cat("\nListo. Resultados y gráficos guardados en: ", normalizePath(out_dir), "\n")
+
+```
+

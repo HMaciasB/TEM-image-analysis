@@ -1,0 +1,437 @@
+---
+title: "20250825_types"
+author: "Henry Macías"
+date: "8/25/2025"
+output: html_document
+---
+
+```{r}
+# SCRIPT COMPLETO - COMPARACIÓN CELULAR POR FENOTIPO Y TIPO DE CÉLULA
+
+# LIBRERÍAS
+library(readr)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(car)
+library(nortest)
+library(FSA)
+library(multcomp)
+library(openxlsx)
+
+# CARGAR DATOS
+
+data <- types_combined_FILTERED
+
+# EXTRAER ID DE MUESTRA (ej. de 2PEL1_3_invert.tif --> 2PEL1)
+data <- data %>%
+  mutate(Sample_ID = str_extract(Name, "^[^_]+"))
+
+# AGRUPAR Y PROMEDIAR POR MUESTRA Y TIPO CELULAR
+vars_to_summarise <- c("Area", "Circularity", "Max_diameter", "Min_diameter")
+summary_data <- data %>%
+  group_by(Sample_ID, Phenotype, Cellular_Type) %>%
+  summarise(across(all_of(vars_to_summarise), mean, na.rm = TRUE), .groups = "drop")
+
+# RECUENTO DE CÉLULAS POR MUESTRA Y TIPO CELULAR
+cell_counts <- data %>%
+  group_by(Name, Sample_ID, Phenotype, Cellular_Type) %>%
+  summarise(Cell_Count = n(), .groups = "drop") %>%
+  group_by(Sample_ID, Phenotype, Cellular_Type) %>%
+  summarise(Mean_Cell_Count = mean(Cell_Count), .groups = "drop")
+
+# JUNTAR RECUENTOS Y PROMEDIOS
+combined_data <- left_join(summary_data, cell_counts,
+                           by = c("Sample_ID", "Phenotype", "Cellular_Type"))
+
+# CREAR VARIABLE DE GRUPO PARA ANÁLISIS (ej. PEL_NORMAL_TYPE1)
+combined_data <- combined_data %>%
+  mutate(Grupo = paste(Phenotype, Cellular_Type, sep = "_")) %>%
+  mutate(Grupo = factor(Grupo))
+
+# FUNCIÓN PARA ESTADÍSTICA
+analyze_variable <- function(df, variable, group_col = "Grupo") {
+  df <- df %>% filter(!is.na(.data[[variable]]))
+  formula <- as.formula(paste(variable, "~", group_col))
+
+  # Normalidad por grupo
+  normality <- df %>%
+    group_by(.data[[group_col]]) %>%
+    summarise(
+      n = n(),
+      shapiro_p = ifelse(n > 3, shapiro.test(.data[[variable]])$p.value, NA),
+      ad_p = ifelse(n > 7, ad.test(.data[[variable]])$p.value, NA),
+      normal = ifelse(!is.na(shapiro_p) && shapiro_p > 0.05, TRUE,
+                      ifelse(!is.na(ad_p) && ad_p > 0.05, TRUE, FALSE)),
+      .groups = "drop"
+    )
+
+  # Homogeneidad
+  levene <- broom::tidy(leveneTest(formula, data = df))
+
+  # Elegir prueba
+  if (all(normality$normal, na.rm = TRUE) && levene$p.value[1] > 0.05) {
+    modelo <- aov(formula, data = df)
+    tukey <- glht(modelo, linfct = mcp(Grupo = "Tukey"))
+    posthoc <- data.frame(summary(tukey)$test[c("pvalues", "tstat")])
+    posthoc$Comparison <- rownames(summary(tukey)$test$coefficients)
+    posthoc$Metodo <- "Tukey"
+    test_global <- summary(modelo)[[1]]
+    test_type <- "ANOVA"
+    test_stat <- test_global$`F value`[1]
+    test_p <- test_global$`Pr(>F)`[1]
+  } else {
+    kruskal <- kruskal.test(formula, data = df)
+    dunn <- dunnTest(formula, data = df, method = "bonferroni")$res
+    posthoc <- dunn
+    posthoc$Metodo <- "Dunn"
+    test_type <- "Kruskal-Wallis"
+    test_stat <- kruskal$statistic
+    test_p <- kruskal$p.value
+  }
+
+  posthoc <- posthoc %>%
+    mutate(Significativo = ifelse(P.adj < 0.05, "Sí", "No"))
+
+  list(
+    normality = normality,
+    homogeneity = levene,
+    test_global = data.frame(Variable = variable, Metodo = test_type, Estadistico = test_stat, p.valor = test_p),
+    posthoc = posthoc
+  )
+}
+
+# APLICAR A TODAS LAS VARIABLES
+variables <- c("Area", "Circularity", "Max_diameter", "Min_diameter", "Mean_Cell_Count")
+normalidad_list <- list()
+homogeneity_list <- list()
+test_global_list <- list()
+posthoc_list <- list()
+
+for (v in variables) {
+  r <- analyze_variable(combined_data, v)
+  normalidad_list[[v]] <- r$normality %>% mutate(Variable = v)
+  homogeneity_list[[v]] <- r$homogeneity %>% mutate(Variable = v)
+  test_global_list[[v]] <- r$test_global
+  posthoc_list[[v]] <- r$posthoc %>% mutate(Variable = v)
+}
+
+# COMBINAR TODO
+df_normalidad <- bind_rows(normalidad_list)
+df_levene <- bind_rows(homogeneity_list)
+df_test_global <- bind_rows(test_global_list)
+df_posthoc <- bind_rows(posthoc_list)
+
+# GUARDAR RESULTADOS EN EXCEL
+write.xlsx(
+  list(
+    Recuento_Promedio_Celulas = combined_data,
+    Supuestos_Normalidad = df_normalidad,
+    Supuestos_Levene = df_levene,
+    Test_Global = df_test_global,
+    Comparaciones_PostHoc = df_posthoc
+  ),
+  file = "RESULTADOS_CELLULAR_ANALYSIS.xlsx"
+)
+
+```
+
+
+```{r}
+# Librerías necesarias
+library(dplyr)
+library(readr)
+library(tidyr)
+library(ggplot2)
+library(ggpubr)
+library(nortest)
+library(car)
+library(openxlsx)
+library(broom)
+
+# Leer datos
+data <- types_combined_FILTERED
+
+# Extraer ID biológico eliminando el sufijo de la imagen
+# Ejemplo: "2PEL1_3_invert.tif" -> "2PEL1"
+data <- data %>%
+  mutate(Biol_Sample_ID = sub("_\\\\[^_]+_invert\\\.tif$", "", Name))
+
+# Verificar variables numéricas
+numeric_vars <- c("Area", "Circularity", "Max_diameter", "Min_diameter")
+
+# Agrupar por muestra biológica y tipo celular y calcular promedios
+summary_data <- data %>%
+  group_by(Biol_Sample_ID, Phenotype, Cellular_Type) %>%
+  summarise(across(all_of(numeric_vars), mean, na.rm = TRUE),
+            Cell_Count = n(), .groups = "drop")
+
+# Exportar tabla resumida (datos promediados por muestra)
+write_csv(summary_data, "summary_data_by_sample.csv")
+
+# Comparaciones: NORMAL vs MUTANT dentro de cada fenotipo
+comparisons_norm_mut <- summary_data %>%
+  group_by(Phenotype) %>%
+  group_split()
+
+# Comparaciones: PEL vs WT dentro de cada tipo celular
+comparisons_pel_wt <- summary_data %>%
+  group_by(Cellular_Type) %>%
+  group_split()
+
+# Funciones para estadística y visualización
+evaluate_and_plot <- function(df, group_col, group_levels, var_name, out_prefix) {
+  df[[group_col]] <- factor(df[[group_col]], levels = group_levels)
+  formula <- reformulate(group_col, response = var_name)
+
+  # Test de normalidad
+  normality <- df %>%
+    group_by(.data[[group_col]]) %>%
+    summarise(n = n(),
+              shapiro_p = ifelse(n > 3, shapiro.test(.data[[var_name]])$p.value, NA),
+              ad_p = ifelse(n > 7, ad.test(.data[[var_name]])$p.value, NA),
+              normal = ifelse(!is.na(shapiro_p) && shapiro_p > 0.05, TRUE,
+                               ifelse(!is.na(ad_p) && ad_p > 0.05, TRUE, FALSE)),
+              .groups = "drop")
+
+  # Test de homogeneidad
+  levene_result <- broom::tidy(leveneTest(formula, data = df))
+
+  # Kruskal-Wallis
+  kruskal_result <- kruskal.test(formula, data = df)
+
+  # Graficar
+  p <- ggplot(df, aes_string(x = group_col, y = var_name, fill = group_col)) +
+    geom_boxplot() +
+    geom_jitter(width = 0.15, alpha = 0.6) +
+    stat_compare_means(method = "kruskal.test", label.y = max(df[[var_name]], na.rm = TRUE) * 1.1) +
+    theme_minimal() +
+    ggtitle(paste("Comparación de", var_name, "por", group_col))
+
+  ggsave(paste0(out_prefix, "_", var_name, ".png"), p, width = 7, height = 5)
+
+  return(list(
+    normality = normality,
+    levene = levene_result,
+    kruskal = tidy(kruskal_result),
+    plot = p
+  ))
+}
+
+# Aplicar a todas las variables para cada comparación
+test_results <- list()
+
+# NORMAL vs MUTANT dentro de cada fenotipo
+for (group in comparisons_norm_mut) {
+  phenotype <- unique(group$Phenotype)
+  for (v in numeric_vars) {
+    res <- evaluate_and_plot(group, "Cellular_Type", c("NORMAL_TYPE1", "MUTANT_TYPE2"), v,
+                             out_prefix = paste0("comparison_Normal_vs_Mutant_", phenotype))
+    test_results[[paste("Norm_vs_Mut", phenotype, v, sep = "_")]] <- res
+  }
+}
+
+# PEL vs WT dentro de cada tipo celular
+for (group in comparisons_pel_wt) {
+  celltype <- unique(group$Cellular_Type)
+  for (v in numeric_vars) {
+    res <- evaluate_and_plot(group, "Phenotype", c("PEL", "WT"), v,
+                             out_prefix = paste0("comparison_PEL_vs_WT_", celltype))
+    test_results[[paste("PEL_vs_WT", celltype, v, sep = "_")]] <- res
+  }
+}
+
+# Exportar resultados estadísticos a Excel
+wb <- createWorkbook()
+
+for (name in names(test_results)) {
+  res <- test_results[[name]]
+  addWorksheet(wb, paste0(name, "_normality"))
+  writeData(wb, sheet = paste0(name, "_normality"), res$normality)
+
+  addWorksheet(wb, paste0(name, "_levene"))
+  writeData(wb, sheet = paste0(name, "_levene"), res$levene)
+
+  addWorksheet(wb, paste0(name, "_kruskal"))
+  writeData(wb, sheet = paste0(name, "_kruskal"), res$kruskal)
+}
+
+saveWorkbook(wb, "estadisticas_completas_por_variable.xlsx", overwrite = TRUE)
+
+```
+10:50H
+```{r}
+# Librerías
+library(tidyverse)
+library(readr)
+library(readxl)
+library(openxlsx)
+library(nortest)
+library(car)
+library(FSA)
+library(ggpubr)
+library(ggsignif)
+library(broom)
+
+# Leer datos
+data <- read_csv("types_combined_FILTERED.csv")
+
+# Extraer muestra base
+data <- data %>%
+  mutate(
+    Muestra = sub("_.*", "", Name)
+  )
+
+# Paso 1: Agregación por imagen (Name)
+por_imagen <- data %>%
+  group_by(Name, Muestra, Phenotype, Cellular_Type) %>%
+  summarise(
+    N_cells = n(),
+    Area = mean(Area, na.rm = TRUE),
+    Circularity = mean(Circularity, na.rm = TRUE),
+    Max_diameter = mean(Max_diameter, na.rm = TRUE),
+    Min_diameter = mean(Min_diameter, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Paso 2: Agregación por muestra base
+por_muestra <- por_imagen %>%
+  group_by(Muestra, Phenotype, Cellular_Type) %>%
+  summarise(
+    N_cells = mean(N_cells),
+    Area = mean(Area),
+    Circularity = mean(Circularity),
+    Max_diameter = mean(Max_diameter),
+    Min_diameter = mean(Min_diameter),
+    .groups = "drop"
+  )
+
+# Para análisis posterior, combinamos variables morfométricas
+long_data <- por_muestra %>%
+  pivot_longer(cols = Area:Min_diameter, names_to = "Variable", values_to = "Valor")
+
+# Crear estructuras para exportar
+resumen_global <- list()
+resultados_globales <- data.frame()
+posthoc_list <- list()
+signif_list <- list()
+supuestos_normalidad <- list()
+supuestos_levene <- list()
+
+# Comparaciones deseadas
+comparaciones_deseadas <- list(
+  PEL = list(
+    groups = c("PEL_NORMAL", "PEL_MUTANT"),
+    data = filter(por_muestra, Phenotype == "PEL")
+  ),
+  WT = list(
+    groups = c("WT_NORMAL", "WT_MUTANT"),
+    data = filter(por_muestra, Phenotype == "WT")
+  ),
+  TYPE = list(
+    groups = c("PEL_NORMAL", "WT_NORMAL", "PEL_MUTANT", "WT_MUTANT"),
+    data = por_muestra
+  )
+)
+
+# Unir grupo por columnas auxiliares
+por_muestra <- por_muestra %>%
+  mutate(Grupo = paste(Phenotype, gsub("TYPE", "", Cellular_Type), sep = "_"))
+
+# Función asteriscos
+asteriscos <- function(p) {
+  if (is.na(p)) return("n.s.")
+  if (p < 0.001) return("***")
+  else if (p < 0.01) return("**")
+  else if (p < 0.05) return("*")
+  else return("n.s.")
+}
+
+# Análisis por variable y comparación
+for (var in c("Area", "Circularity", "Max_diameter", "Min_diameter")) {
+  for (test_name in names(comparaciones_deseadas)) {
+    grupo <- comparaciones_deseadas[[test_name]]$groups
+    datos <- comparaciones_deseadas[[test_name]]$data
+    datos_var <- datos %>% filter(Grupo %in% grupo)
+    formula <- reformulate("Grupo", response = var)
+    
+    # Normalidad
+    norm_data <- datos_var %>%
+      group_by(Grupo) %>%
+      summarise(
+        Shapiro = ifelse(n() >= 3, shapiro.test(.data[[var]])$p.value, NA),
+        AD = ifelse(n() >= 7, ad.test(.data[[var]])$p.value, NA),
+        Normal = ifelse(!is.na(Shapiro) && Shapiro > 0.05, TRUE,
+                        ifelse(!is.na(AD) && AD > 0.05, TRUE, FALSE)),
+        .groups = "drop"
+      )
+    supuestos_normalidad[[paste0(var, "_", test_name)]] <- norm_data
+
+    # Homogeneidad
+    lev <- leveneTest(formula, data = datos_var)
+    supuestos_levene[[paste0(var, "_", test_name)]] <- tidy(lev)
+
+    # Test global
+    normal_all <- all(norm_data$Normal, na.rm = TRUE)
+    homog <- tidy(lev)$p.value[1] > 0.05
+
+    if (normal_all && homog) {
+      modelo <- aov(formula, data = datos_var)
+      resultado <- summary(modelo)[[1]]
+      test <- "ANOVA"
+      ph <- TukeyHSD(modelo)
+      ph_df <- as.data.frame(ph[[1]]) %>%
+        rownames_to_column("Comparison") %>%
+        mutate(Metodo = "Tukey", Variable = var)
+    } else {
+      modelo <- kruskal.test(formula, data = datos_var)
+      test <- "Kruskal"
+      ph_df <- dunnTest(formula, data = datos_var, method = "bonferroni")$res %>%
+        mutate(Metodo = "Dunn", Variable = var)
+    }
+
+    # Significancia
+    ph_df$Significancia <- sapply(ph_df$P.adj, asteriscos)
+    posthoc_list[[paste0(var, "_", test_name)]] <- ph_df
+
+    # Gráfico
+    gg <- ggplot(datos_var, aes(x = Grupo, y = .data[[var]], fill = Grupo)) +
+      geom_violin(alpha = 0.3, trim = TRUE) +
+      geom_boxplot(width = 0.2) +
+      theme_minimal() +
+      labs(title = paste0("Comparación: ", test_name, " – ", var), y = var, x = "") +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+      stat_compare_means(comparisons = combn(grupo, 2, simplify = FALSE), method = "t.test", label = "p.signif")
+    
+    ggsave(paste0("PLOT_", test_name, "_", var, ".svg"), plot = gg, width = 6, height = 5)
+    ggsave(paste0("PLOT_", test_name, "_", var, ".jpg"), plot = gg, width = 6, height = 5, dpi = 300)
+  }
+}
+
+# Gráfico de barras (conteo de células por grupo)
+barra <- por_muestra %>%
+  group_by(Phenotype, Cellular_Type) %>%
+  summarise(Promedio_celulas = mean(N_cells), .groups = "drop") %>%
+  ggplot(aes(x = Phenotype, y = Promedio_celulas, fill = Cellular_Type)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  labs(title = "Número promedio de células por tipo", y = "Número de células", x = "") +
+  theme_minimal()
+
+ggsave("CELL_COUNTS_BAR.svg", barra, width = 6, height = 4)
+ggsave("CELL_COUNTS_BAR.jpg", barra, width = 6, height = 4, dpi = 300)
+
+# Exportar a Excel
+write.xlsx(
+  list(
+    Supuestos_Normalidad = bind_rows(supuestos_normalidad, .id = "Variable"),
+    Supuestos_Levene = bind_rows(supuestos_levene, .id = "Variable"),
+    PostHoc = bind_rows(posthoc_list, .id = "Variable"),
+    Por_Imagen = por_imagen,
+    Por_Muestra = por_muestra
+  ),
+  file = "RESULTADOS_ANALISIS_TIPOS_CELULAS.xlsx"
+)
+
+```
+
